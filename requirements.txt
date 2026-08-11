@@ -1,0 +1,17 @@
+# Core app
+streamlit>=1.32
+pandas>=2.0
+numpy>=1.24
+pypdf>=4.0
+
+# LLM / agent stack
+langchain-google-genai>=2.0
+langgraph>=0.2
+pydantic>=2.6
+
+# External services
+tavily-python>=0.3
+requests>=2.31
+
+# Configuration (imported by the original scripts; was missing before)
+python-dotenv>=1.0
