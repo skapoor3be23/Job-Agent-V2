@@ -187,23 +187,18 @@ def section_resume_changes(result) -> None:
             st.write(f"- {action}")
 
     with st.expander("Full breakdown"):
-        if rec.emphasize:
-            st.markdown("**Already present — emphasize more**")
-            st.caption("Verified skills already in your resume that match this job but are currently secondary.")
-            st.write(", ".join(rec.emphasize))
-
-        if rec.phrasing_suggestions:
-            st.markdown("**Reword existing content**")
-            for item in rec.phrasing_suggestions:
-                st.write(f"- {item}")
-
-        if rec.missing_skills:
-            st.markdown("**Missing from your resume — do not add unless genuinely true**")
-            rows = [
-                {"Skill": g.skill, "Estimated score impact": f"+{g.estimated_score_gain} pts"}
-                for g in rec.missing_skills
-            ]
-            st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+        st.caption(
+            "Suggested wording is either text already on your resume (repositioned for "
+            "emphasis) or a reword of existing content — never a new claim."
+        )
+        for action in rec.detailed_actions:
+            st.markdown(f"**{action.what_to_change}**")
+            if action.suggested_wording:
+                st.code(action.suggested_wording, language=None)
+            st.caption(action.why)
+            if action.estimated_score_gain is not None:
+                st.caption(f"Estimated score impact: +{action.estimated_score_gain} pts")
+            st.divider()
 
         if rec.unscored_gaps:
             st.markdown("**Other gaps identified (score impact not calculable)**")

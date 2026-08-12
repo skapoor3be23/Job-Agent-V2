@@ -177,6 +177,22 @@ def test_current_job_fit_blocks_a_senior_role_for_a_junior_candidate():
     assert result.fit.priority in ("Low Priority", "Stretch Opportunity")
 
 
+def test_cover_note_unavailable_reason_is_specific_not_generic():
+    """The Cover Note section must show the actual failure reason (as
+    LLMUnavailable reports it), never a hardcoded dead-end message that
+    hides why generation failed."""
+    settings = Settings(discovery_enabled=False)
+    metrics = new_run(settings)
+    clients = make_clients(settings, metrics, llm_responses=RESPONSES, llm_fail_on=["cover_note"])
+    result = run_pipeline(
+        resume_text=RESUME, company="Northwind", title="ML Intern", jd_text=JD,
+        settings=settings, clients=clients, metrics=metrics,
+    )
+    assert result.cover_note.status == "unavailable"
+    assert result.cover_note.reason == "mock failure for cover_note"
+    assert result.cover_note.reason != "The cover note could not be generated."
+
+
 def test_resume_recommendations_reflect_the_gap_analysis():
     """resume_recommendations must be populated from the same gap analysis
     shown elsewhere in the run, with no fabricated skills."""

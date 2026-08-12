@@ -188,7 +188,7 @@ def node_cover_note(state: PipelineState) -> Dict[str, Any]:
             return {
                 "cover_note": CoverNote(
                     job_id=job_id, company=company, title=title, status="unavailable",
-                    reason="The cover note could not be generated.",
+                    reason=str(exc),
                 ),
                 "stage_notes": [f"Cover note unavailable: {exc}"],
             }

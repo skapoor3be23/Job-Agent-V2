@@ -214,6 +214,29 @@ class ResumeSkillGap(BaseModel):
     )
 
 
+class ResumeActionItem(BaseModel):
+    """One concrete, directly usable resume change.
+
+    suggested_wording is either text already on the resume (verbatim, for
+    repositioning/emphasis) or an LLM-produced reword of existing content
+    (gap.resume_edits, itself constrained to reword only what already
+    exists) -- never new text describing a skill/project/achievement the
+    candidate does not have. It is empty when no safe wording applies (a
+    missing skill, or a skill with no example tied to it).
+    """
+
+    what_to_change: str
+    suggested_wording: str = Field(
+        default="",
+        description="Text the user can paste directly; empty if no safe wording applies",
+    )
+    why: str
+    estimated_score_gain: Optional[int] = Field(
+        default=None,
+        description="Points this specific change would add under the current scoring model; None if not deterministically calculable",
+    )
+
+
 class ResumeRecommendations(BaseModel):
     """Deterministic, non-fabricating suggestions for the current job only.
 
@@ -236,6 +259,10 @@ class ResumeRecommendations(BaseModel):
     unscored_gaps: List[str] = Field(
         default_factory=list,
         description="Additional gaps identified by the LLM gap analysis that fall outside the deterministic skill vocabulary -- score impact is not calculable for these",
+    )
+    detailed_actions: List[ResumeActionItem] = Field(
+        default_factory=list,
+        description="What to change / suggested wording / why / score impact, one entry per high-impact change, for the Full breakdown view",
     )
     coverage_now: float = 0.0
     status: Literal["ok", "insufficient_data", "skipped"] = "skipped"

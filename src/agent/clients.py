@@ -29,6 +29,48 @@ class LLMUnavailable(RuntimeError):
 
 
 # --------------------------------------------------------------------------
+# Provider-failure classification
+#
+# A generic "LLM call failed (SomeException)" told the user nothing
+# actionable and buried the real reason (e.g. a provider quota being
+# exhausted) in debug logs only. These give every LLMUnavailable a specific,
+# safe (no key/value leakage) description, and let callers skip a pointless
+# second real request when the first one failed for a reason a retry with a
+# different call shape cannot fix.
+# --------------------------------------------------------------------------
+
+_HARD_FAILURE_MARKERS = (
+    "resource_exhausted", "429", "quota",
+    "permission_denied", "403", "api key not valid", "unauthenticated",
+    "unavailable", "503",
+)
+
+
+def _is_hard_provider_failure(exc: Exception) -> bool:
+    """True for quota/auth/outage failures: retrying via a different call
+    shape (e.g. the JSON-contract fallback) will fail identically and only
+    burns a second request against an already-scarce quota."""
+    return any(marker in str(exc).lower() for marker in _HARD_FAILURE_MARKERS)
+
+
+def _describe_llm_failure(exc: Exception) -> str:
+    """A short, specific, user-facing reason -- never a bare exception
+    class name the user can't act on."""
+    text = str(exc).lower()
+    if "resource_exhausted" in text or "429" in text or "quota" in text:
+        return (
+            "The Gemini API quota has been used up for now. Try again "
+            "later, or check your plan/billing at "
+            "https://ai.google.dev/gemini-api/docs/rate-limits."
+        )
+    if "permission_denied" in text or "403" in text or "api key not valid" in text or "unauthenticated" in text:
+        return "The Gemini API rejected the request (invalid or unauthorized API key)."
+    if "unavailable" in text or "503" in text:
+        return "The Gemini API is temporarily unavailable. Try again shortly."
+    return f"LLM call failed ({type(exc).__name__})."
+
+
+# --------------------------------------------------------------------------
 # Defensive structured-output parsing
 # --------------------------------------------------------------------------
 
@@ -101,14 +143,17 @@ class LLMClient:
             response = self.client.invoke(prompt)
         except Exception as exc:
             logger.warning("LLM call failed: %s", type(exc).__name__)
-            raise LLMUnavailable(f"LLM call failed ({type(exc).__name__})") from exc
+            raise LLMUnavailable(_describe_llm_failure(exc)) from exc
         return getattr(response, "content", str(response))
 
     def structured(self, prompt: str, schema: Type[TModel]) -> TModel:
         """One structured completion.
 
         Prefers the provider's native structured output; falls back to a
-        JSON contract in the prompt. Either way this is a SINGLE charged call.
+        JSON contract in the prompt. Either way this is a SINGLE charged call
+        -- but if the native attempt fails for a reason a retry cannot fix
+        (quota/auth/outage), that failure is raised immediately rather than
+        spending a second real request that would fail identically.
         """
         self.metrics.charge_llm()
         try:
@@ -121,12 +166,14 @@ class LLMClient:
         except BudgetExceeded:
             raise
         except Exception as exc:
+            if _is_hard_provider_failure(exc):
+                raise LLMUnavailable(_describe_llm_failure(exc)) from exc
             logger.debug("native structured output unavailable (%s); using JSON contract", type(exc).__name__)
 
         try:
             raw = self.client.invoke(prompt + schema_instructions(schema))
         except Exception as exc:
-            raise LLMUnavailable(f"LLM call failed ({type(exc).__name__})") from exc
+            raise LLMUnavailable(_describe_llm_failure(exc)) from exc
         return parse_structured(getattr(raw, "content", str(raw)), schema)
 
 
