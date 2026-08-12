@@ -46,6 +46,15 @@ BANNED_PHRASES = [
     "hard worker",
     "go-getter",
     "wealth of experience",
+    "i am writing to express",
+    "i am writing to apply",
+    "in today's fast-paced",
+    "in today's ever-evolving",
+    "leverage my skills",
+    "look forward to the opportunity to discuss",
+    "thank you for considering my application",
+    "dynamic environment",
+    "results-driven",
 ]
 
 # Words that signal an unsourced claim about the employer.
@@ -94,14 +103,31 @@ Job title: {title}
    has not demonstrated, do not imply they have it. Silence is acceptable.
 4. INTEREST. Ground stated interest in something concrete from the JOB
    DESCRIPTION (the actual work) rather than praise of the company.
-5. LENGTH. {min_words}-{max_words} words.
-6. TONE. Direct and specific, as a real candidate would write. Ban these
-   phrases entirely: "passionate about", "quick learner", "team player",
-   "perfect fit", "excited to bring my skills", "hit the ground running".
-7. Address {company} for the {title} role and no other company or role.
+5. STRUCTURE. Do not string tools or technologies together as a list
+   ("skilled in Python, PyTorch, Docker and AWS"). For each point, use this
+   shape in full sentences: name ONE concrete piece of evidence from the
+   candidate's resume -> connect it explicitly to a specific requirement or
+   responsibility named in the JOB DESCRIPTION -> say briefly why that
+   matters for the actual work of this role. Make 2-3 such connections,
+   not more -- depth on a few real links beats mentioning everything.
+6. LENGTH. {min_words}-{max_words} words. Every sentence must earn its
+   place -- cut throat-clearing, cut restatement of the job title the
+   reader already knows, cut anything that could apply to any company.
+7. OPENING. Do not open with a generic statement of interest or intent
+   ("I am writing to..."). Open with the single strongest concrete link
+   between the candidate's evidence above and what this specific role
+   needs -- a sentence that could only be written for this candidate and
+   this posting.
+8. TONE. Write as a real, direct candidate, not an AI assistant summarizing
+   a resume. Plain, confident, specific sentences over broad claims. Ban
+   these phrases entirely: "passionate about", "quick learner", "team
+   player", "perfect fit", "excited to bring my skills", "hit the ground
+   running", "leverage my skills", "results-driven", "dynamic environment".
+9. Address {company} for the {title} role and no other company or role.
 
 Return only the cover note text. No subject line, no salutation placeholders
-like [Hiring Manager], no commentary.
+like [Hiring Manager], no sign-off commentary, no meta-commentary about the
+note itself.
 """
 
 NO_FACTS_RULE = (

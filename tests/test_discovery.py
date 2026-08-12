@@ -1,7 +1,7 @@
 """Opportunity Discovery: ranking, priority, roadmap, malformed input."""
 import pytest
 from agent.config import ScoreWeights, Settings
-from agent.ranking import rank_normalize, score_opportunities, assign_priority
+from agent.ranking import ELIGIBILITY_SCORE_MAP, rank_normalize, score_opportunities, assign_priority
 from agent.roadmap import build_roadmap
 from agent.schemas import CandidateProfile, JobPosting, ResumeEvidence
 from agent.identity import make_job_id
@@ -116,3 +116,90 @@ def test_duplicate_jobs_collapse_by_job_id():
     assert a.job_id == b.job_id
     seen = {j.job_id: j for j in [a, b]}
     assert len(seen) == 1
+
+
+# ---------------------------------------------------------------------------
+# Eligibility -> Opportunity (single source of truth, no dead fields)
+# ---------------------------------------------------------------------------
+
+def test_eligibility_score_map_strictly_orders_confidence():
+    assert ELIGIBILITY_SCORE_MAP["eligible"] > ELIGIBILITY_SCORE_MAP["likely_eligible"]
+    assert ELIGIBILITY_SCORE_MAP["likely_eligible"] > ELIGIBILITY_SCORE_MAP["uncertain"]
+    assert ELIGIBILITY_SCORE_MAP["uncertain"] > ELIGIBILITY_SCORE_MAP["ineligible"]
+
+
+def test_opportunity_carries_the_full_eligibility_result():
+    """The EligibilityResult computed for a job must reach the Opportunity,
+    not be discarded down to a bare float + blocker string."""
+    opps = score_opportunities([WEAK], PROFILE, "Python", None, [None], ScoreWeights())
+    o = opps[0]
+    assert o.eligibility_status == "ineligible"
+    assert o.eligibility_explanation
+    assert o.blockers
+
+
+def test_likely_eligible_scores_higher_than_uncertain_end_to_end():
+    """likely_eligible (no confirming signal, but nothing wrong either) and
+    uncertain (an explicit but small experience-shortfall warning) must not
+    collapse to the same score."""
+    likely = job("Zeta", "Data Scientist", "Python and SQL needed.", "https://x.com/likely")
+    uncertain = job(
+        "Eta", "Data Scientist", "Python and SQL needed. Requires 2 years of experience.",
+        "https://x.com/uncertain",
+    )
+    opps = score_opportunities(
+        [likely, uncertain], PROFILE, "Python SQL", None, [None, None], ScoreWeights()
+    )
+    by_id = {o.job.job_id: o for o in opps}
+    likely_opp = by_id[likely.job_id]
+    uncertain_opp = by_id[uncertain.job_id]
+
+    assert likely_opp.eligibility_status == "likely_eligible"
+    assert uncertain_opp.eligibility_status == "uncertain"
+    assert likely_opp.score.experience_match > uncertain_opp.score.experience_match
+    assert not likely_opp.blockers and not uncertain_opp.blockers
+
+
+def test_missing_eligibility_result_is_resolved_not_assumed_safe():
+    """score_opportunities must never fall back to an optimistic constant
+    when eligibility_results doesn't cover a job -- it must actually run
+    the canonical eligibility engine."""
+    opps = score_opportunities([WEAK], PROFILE, "Python", None, [None], ScoreWeights())
+    assert opps[0].blockers
+    assert opps[0].priority in ("Low Priority", "Stretch Opportunity")
+
+
+# ---------------------------------------------------------------------------
+# Deterministic ordering (no network-completion-order / arbitrary bias)
+# ---------------------------------------------------------------------------
+
+def test_stretch_opportunity_reason_never_contains_the_positive_eligibility_message():
+    """A junior-titled job with a genuine blocker (large years shortfall)
+    must report the real blocker in Opportunity.blockers/priority_reason,
+    never the positive 'explicitly targeted' explanation eligibility.py
+    produces when nothing is actually wrong."""
+    strong_but_blocked = job(
+        "Gamma", "Junior Backend Developer",
+        "Junior Backend Developer. Python, PyTorch, NLP, SQL required. 8+ years of experience required.",
+        "https://x.com/blocked",
+    )
+    opps = score_opportunities([strong_but_blocked], PROFILE, "Python PyTorch NLP SQL", None, [None], ScoreWeights())
+    o = opps[0]
+    assert o.eligibility_status == "ineligible"
+    assert o.blockers
+    assert "years of experience" in o.blockers[0]
+    assert "explicitly targeted" not in o.blockers[0]
+    assert "explicitly targeted" not in o.priority_reason
+    assert o.priority == "Stretch Opportunity"
+
+
+def test_tiebreak_by_job_id_is_stable_regardless_of_input_order():
+    a = job("Same", "ML Intern", "Python PyTorch NLP required.", "https://x.com/aaa")
+    b = job("Same", "ML Intern", "Python PyTorch NLP required.", "https://x.com/bbb")
+    assert a.job_id != b.job_id
+
+    forward = score_opportunities([a, b], PROFILE, "Python PyTorch NLP", None, [None, None], ScoreWeights())
+    backward = score_opportunities([b, a], PROFILE, "Python PyTorch NLP", None, [None, None], ScoreWeights())
+
+    assert [o.job.job_id for o in forward] == [o.job.job_id for o in backward]
+    assert [o.job.job_id for o in forward] == sorted([a.job_id, b.job_id])

@@ -2,7 +2,7 @@
 carries Company A's information."""
 import pytest
 from agent.config import Settings
-from agent.cover_note import build_generation_prompt, validate_cover_note, NO_FACTS_RULE
+from agent.cover_note import BANNED_PHRASES, build_generation_prompt, validate_cover_note, NO_FACTS_RULE
 from agent.graph import run_pipeline
 from agent.schemas import CandidateProfile, CompanyResearch, VerifiedFact, _FactExtraction, GapAnalysis
 from agent.telemetry import new_run
@@ -68,6 +68,17 @@ def test_note_never_names_target_company_is_warned():
     r = validate_cover_note(f"I would like this role. {FILLER}", "Zylo", "ML Intern",
                             PROFILE, GOOD_RESEARCH, Settings())
     assert any("never names" in w for w in r.warnings)
+
+
+def test_ai_cliche_openers_are_flagged_as_filler():
+    note = f"I am writing to express my interest in this role at Zylo. {FILLER}"
+    r = validate_cover_note(note, "Zylo", "ML Intern", PROFILE, GOOD_RESEARCH, Settings())
+    assert any("i am writing to express" in w for w in r.warnings)
+
+
+def test_new_banned_phrases_are_registered():
+    for phrase in ("i am writing to express", "leverage my skills", "dynamic environment"):
+        assert phrase in BANNED_PHRASES
 
 
 def test_two_companies_in_one_session_do_not_cross_contaminate():

@@ -76,10 +76,6 @@ class ScoreWeights:
 
 @dataclass(frozen=True)
 class Settings:
-    # --- feature switch (Phase: backward compatibility) ---
-    use_new_pipeline: bool = True
-    allow_legacy_fallback: bool = True
-
     # --- models ---
     chat_model: str = "gemini-2.5-flash"
     embedding_model: str = "models/gemini-embedding-001"
@@ -120,8 +116,6 @@ class Settings:
     @classmethod
     def load(cls) -> "Settings":
         s = cls(
-            use_new_pipeline=_get_bool("USE_NEW_PIPELINE", True),
-            allow_legacy_fallback=_get_bool("ALLOW_LEGACY_FALLBACK", True),
             chat_model=_get_str("CHAT_MODEL", "gemini-2.5-flash"),
             embedding_model=_get_str("EMBEDDING_MODEL", "models/gemini-embedding-001"),
             chat_temperature=_get_float("CHAT_TEMPERATURE", 0.3),

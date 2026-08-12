@@ -52,16 +52,40 @@ SENIORITY_PATTERNS = {
 # "3 years of experience"
 # "minimum 3 years"
 # "at least 3 years"
+# "5 years in a similar role"
+#
+# A bare "<N> years" is NOT enough on its own: JDs routinely say things like
+# "Amgen helped establish the biotechnology industry more than 40 years
+# ago", which is company history, not a candidate requirement. Each pattern
+# therefore requires an explicit qualifier word before the number OR an
+# explicit "experience"/"role" phrase after it -- never a number floating
+# with no experience-indicating context.
 EXPERIENCE_PATTERNS = [
     re.compile(
-        r"\b(?:minimum|at least|required|must have)?\s*(\d+(?:\.\d+)?)\s*\+?\s*years?\b",
+        r"\b(?:minimum(?:\s+of)?|at\s+least|requires?|required|must\s+have)\s+"
+        r"(\d+(?:\.\d+)?)\s*\+?\s*years?\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(\d+(?:\.\d+)?)\s*\+?\s*years?\s+"
+        r"(?:of\s+)?(?:relevant\s+|related\s+|professional\s+|work\s+)?experience\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(\d+(?:\.\d+)?)\s*\+?\s*years?\s+in\s+(?:a\s+)?(?:similar|related)\s+role\b",
         re.IGNORECASE,
     ),
 ]
 
 
 def _extract_required_years(text: str) -> float:
-    """Return the smallest explicit years-of-experience requirement."""
+    """Return the smallest explicit years-of-experience requirement.
+
+    Only counts a number of years when the surrounding language clearly
+    frames it as a requirement on the candidate -- never a bare "<N> years"
+    that could just as easily be company history ("40 years ago"), product
+    age, or anything else unrelated to eligibility.
+    """
 
     if not text:
         return 0.0
@@ -182,15 +206,21 @@ def analyze_eligibility(
         )
     )
 
-    if candidate_level in {"student", "intern"} and junior_signal:
+    # Blockers and warnings are real, specific findings against this job;
+    # they must always win over the generic positive-signal message below.
+    # Checking the positive signal first (as this used to) let a job with a
+    # junior-friendly title but a genuine blocker (e.g. an unmet years
+    # requirement) report a reassuring explanation while still being marked
+    # ineligible -- a direct contradiction between status and explanation.
+    if blockers:
+        explanation = blockers[0]
+    elif warnings:
+        explanation = warnings[0]
+    elif candidate_level in {"student", "intern"} and junior_signal:
         explanation = (
             "The role is explicitly targeted toward interns, graduates, "
             "or early-career candidates."
         )
-    elif blockers:
-        explanation = blockers[0]
-    elif warnings:
-        explanation = warnings[0]
     else:
         explanation = (
             "No high-confidence eligibility blocker was detected from "

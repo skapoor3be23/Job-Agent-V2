@@ -199,6 +199,49 @@ class Opportunity(BaseModel):
     blockers: List[str] = Field(default_factory=list)
 
 
+class ResumeSkillGap(BaseModel):
+    """One JD requirement the resume does not currently demonstrate.
+
+    estimated_score_gain is the exact point change the deterministic scoring
+    formula would produce if this single skill were genuinely demonstrated --
+    computed the same way roadmap.py computes "unlocks_jobs", never guessed.
+    """
+
+    skill: str
+    estimated_score_gain: int = Field(
+        default=0,
+        description="Points (0-100 scale) the match score would gain if this skill were genuinely added",
+    )
+
+
+class ResumeRecommendations(BaseModel):
+    """Deterministic, non-fabricating suggestions for the current job only.
+
+    Every entry traces to profile.all_skills(), gap.resume_edits, or the JD
+    text itself -- nothing here is invented.
+    """
+
+    emphasize: List[str] = Field(
+        default_factory=list,
+        description="Skills the candidate genuinely has (secondary_skills) that match this JD but are underrepresented",
+    )
+    phrasing_suggestions: List[str] = Field(
+        default_factory=list,
+        description="Rewordings of existing resume content (from gap analysis), not new claims",
+    )
+    missing_skills: List[ResumeSkillGap] = Field(
+        default_factory=list,
+        description="JD requirements not demonstrated in the resume, with an estimated score impact if genuinely acquired",
+    )
+    unscored_gaps: List[str] = Field(
+        default_factory=list,
+        description="Additional gaps identified by the LLM gap analysis that fall outside the deterministic skill vocabulary -- score impact is not calculable for these",
+    )
+    coverage_now: float = 0.0
+    status: Literal["ok", "insufficient_data", "skipped"] = "skipped"
+    note: str = ""
+
+
 class SkillGapItem(BaseModel):
     skill: str
     appears_in_jobs: int = 0

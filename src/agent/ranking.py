@@ -23,8 +23,10 @@ import math
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from .config import ScoreWeights
+from .eligibility import EligibilityResult, analyze_eligibility
 from .schemas import (
     CandidateProfile,
+    GapAnalysis,
     JobPosting,
     Opportunity,
     ScoreBreakdown,
@@ -38,6 +40,29 @@ from .skills import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Eligibility -> numeric score
+# ---------------------------------------------------------------------------
+#
+# eligibility.py is the ONLY module that decides eligibility. This map is the
+# single deterministic translation from its status to a 0..1 score used by
+# the composite formula. The four levels are intentionally NOT collapsed:
+#
+#   eligible        1.00  -- strongest: explicit junior/entry signal matched
+#   likely_eligible 0.80  -- reasonably strong, but no explicit confirming signal
+#   uncertain       0.50  -- meaningfully lower confidence (a real warning exists)
+#   ineligible      0.00  -- blocked; a hard blocker is attached
+#
+# A missing/unknown result is never assumed to be "likely eligible" -- it is
+# always resolved by calling analyze_eligibility() below, never guessed.
+ELIGIBILITY_SCORE_MAP: Dict[str, float] = {
+    "eligible": 1.0,
+    "likely_eligible": 0.8,
+    "uncertain": 0.5,
+    "ineligible": 0.0,
+}
 
 
 # ---------------------------------------------------------------------------
@@ -163,54 +188,48 @@ def _matching_evidence(
 # Eligibility integration
 # ---------------------------------------------------------------------------
 
-def _eligibility_details(
-    eligibility_result,
-) -> Tuple[float, List[str]]:
-    """Convert eligibility.py output into ranking-friendly values.
+def _resolve_eligibility(
+    job: JobPosting,
+    profile: CandidateProfile,
+    eligibility_result: Optional[EligibilityResult],
+) -> EligibilityResult:
+    """Return a real EligibilityResult for this job, computing one if the
+    caller didn't supply it.
 
-    The eligibility module is the source of truth.
-
-    Expected result:
-        status = "eligible" / "ineligible"
-        explanation = human-readable reason
-
-    The helper is intentionally defensive so that a malformed eligibility
-    object does not crash the entire discovery pipeline.
+    There is no "assume it's fine" fallback: a missing entry is resolved by
+    calling the canonical eligibility engine, not by guessing a score.
     """
 
-    if eligibility_result is None:
-        return 0.8, []
+    if eligibility_result is not None:
+        return eligibility_result
+    return analyze_eligibility(job, profile)
 
-    status = str(
-        getattr(
-            eligibility_result,
-            "status",
-            "",
-        )
-    ).strip().lower()
 
-    explanation = str(
-        getattr(
-            eligibility_result,
-            "explanation",
-            "",
-        )
-    ).strip()
+def _eligibility_details(
+    eligibility_result: EligibilityResult,
+) -> Tuple[float, List[str]]:
+    """Convert a resolved EligibilityResult into (score, blockers).
 
-    if status == "eligible":
-        return 1.0, []
+    Only "ineligible" produces a hard blocker for assign_priority(); the
+    other three statuses differ only in score, per ELIGIBILITY_SCORE_MAP.
+    """
+
+    status = (eligibility_result.status or "").strip().lower()
+    score = ELIGIBILITY_SCORE_MAP.get(status, 0.5)
 
     if status == "ineligible":
+        # The actual blocker text is the reason, never the free-text
+        # `explanation` field -- explanation can (correctly) prioritize a
+        # different message and must not overwrite the specific blocker
+        # shown to the user here.
         reason = (
-            explanation
+            (eligibility_result.blockers[0] if eligibility_result.blockers else "")
+            or eligibility_result.explanation
             or "The role does not meet the candidate's eligibility criteria."
         )
+        return score, [reason]
 
-        return 0.0, [reason]
-
-    # Unknown / unavailable eligibility result.
-    # Do not treat uncertainty as a hard blocker.
-    return 0.5, []
+    return score, []
 
 
 # ---------------------------------------------------------------------------
@@ -415,6 +434,75 @@ def _why_apply(
 
 
 # ---------------------------------------------------------------------------
+# Shared opportunity assembly (used for both discovered jobs and the single
+# currently-analyzed job, so the two paths can never compute contradictory
+# scores/eligibility for the same kind of job)
+# ---------------------------------------------------------------------------
+
+def _assemble_opportunity(
+    job: JobPosting,
+    weights: ScoreWeights,
+    required: Sequence[str],
+    cov: float,
+    matched: Sequence[str],
+    missing: Sequence[str],
+    eligibility_result: EligibilityResult,
+    relevance: float,
+    evidence: Sequence[str],
+    semantic_raw: float,
+    semantic_normalized: float,
+) -> Opportunity:
+    eligibility, eligibility_blockers = _eligibility_details(eligibility_result)
+
+    total = (
+        weights.semantic * semantic_normalized
+        + weights.skill_coverage * cov
+        + weights.experience * eligibility
+        + weights.role_relevance * relevance
+    )
+    total = max(0.0, min(1.0, total))
+
+    breakdown = ScoreBreakdown(
+        semantic_raw=round(semantic_raw, 4),
+        semantic_normalized=round(semantic_normalized, 4),
+        skill_coverage=round(cov, 4),
+        experience_match=round(eligibility, 4),
+        role_relevance=round(relevance, 4),
+        total=int(round(total * 100)),
+        formula=(
+            f"{weights.semantic:.0%}x{semantic_normalized:.2f} + "
+            f"{weights.skill_coverage:.0%}x{cov:.2f} + "
+            f"{weights.experience:.0%}x{eligibility:.2f} + "
+            f"{weights.role_relevance:.0%}x{relevance:.2f}"
+        ),
+    )
+
+    priority, reason = assign_priority(
+        coverage_score=cov,
+        eligibility=eligibility,
+        blockers=eligibility_blockers,
+        evidence_count=len(evidence),
+        relevance=relevance,
+    )
+
+    return Opportunity(
+        job=job,
+        score=breakdown,
+        eligibility_status=eligibility_result.status,
+        eligibility_explanation=eligibility_result.explanation,
+        eligibility_warnings=list(eligibility_result.warnings),
+        matched_skills=list(matched),
+        missing_skills=list(missing),
+        evidence=list(evidence),
+        priority=priority,
+        priority_reason=reason,
+        why_match=_why_match(matched, len(hard_requirements(required)), evidence),
+        why_apply=_why_apply(priority, missing, relevance),
+        blockers=eligibility_blockers,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Main scoring function
 # ---------------------------------------------------------------------------
 
@@ -497,17 +585,12 @@ def score_opportunities(
         )
 
         # --------------------------------------------------------
-        # Eligibility analysis
+        # Eligibility analysis (eligibility.py is the sole source of
+        # truth; a missing entry is resolved, never assumed)
         # --------------------------------------------------------
 
-        eligibility_result = eligibility_results.get(
-            job.job_id
-        )
-
-        eligibility, eligibility_blockers = (
-            _eligibility_details(
-                eligibility_result
-            )
+        eligibility_result = _resolve_eligibility(
+            job, profile, eligibility_results.get(job.job_id)
         )
 
         # --------------------------------------------------------
@@ -529,102 +612,23 @@ def score_opportunities(
         )
 
         # --------------------------------------------------------
-        # Composite score
-        # --------------------------------------------------------
-
-        total = (
-            weights.semantic
-            * normalized[i]
-            + weights.skill_coverage
-            * cov
-            + weights.experience
-            * eligibility
-            + weights.role_relevance
-            * relevance
-        )
-
-        total = max(
-            0.0,
-            min(1.0, total),
-        )
-
-        # --------------------------------------------------------
-        # Score breakdown
-        # --------------------------------------------------------
-
-        breakdown = ScoreBreakdown(
-            semantic_raw=round(
-                raw_similarities[i] or 0.0,
-                4,
-            ),
-            semantic_normalized=normalized[i],
-            skill_coverage=round(
-                cov,
-                4,
-            ),
-            experience_match=round(
-                eligibility,
-                4,
-            ),
-            role_relevance=round(
-                relevance,
-                4,
-            ),
-            total=int(
-                round(total * 100)
-            ),
-            formula=(
-                f"{weights.semantic:.0%}x"
-                f"{normalized[i]:.2f} + "
-                f"{weights.skill_coverage:.0%}x"
-                f"{cov:.2f} + "
-                f"{weights.experience:.0%}x"
-                f"{eligibility:.2f} + "
-                f"{weights.role_relevance:.0%}x"
-                f"{relevance:.2f}"
-            ),
-        )
-
-        # --------------------------------------------------------
-        # Priority
-        # --------------------------------------------------------
-
-        priority, reason = assign_priority(
-            coverage_score=cov,
-            eligibility=eligibility,
-            blockers=eligibility_blockers,
-            evidence_count=len(evidence),
-            relevance=relevance,
-        )
-
-        # --------------------------------------------------------
-        # Opportunity object
+        # Score, priority and Opportunity assembly (shared with the
+        # single-job path in evaluate_current_job)
         # --------------------------------------------------------
 
         opportunities.append(
-            Opportunity(
+            _assemble_opportunity(
                 job=job,
-                score=breakdown,
-                matched_skills=matched,
-                missing_skills=missing,
+                weights=weights,
+                required=required,
+                cov=cov,
+                matched=matched,
+                missing=missing,
+                eligibility_result=eligibility_result,
+                relevance=relevance,
                 evidence=evidence,
-                priority=priority,
-                priority_reason=reason,
-                why_match=_why_match(
-                    matched,
-                    len(
-                        hard_requirements(
-                            required
-                        )
-                    ),
-                    evidence,
-                ),
-                why_apply=_why_apply(
-                    priority,
-                    missing,
-                    relevance,
-                ),
-                blockers=eligibility_blockers,
+                semantic_raw=raw_similarities[i] or 0.0,
+                semantic_normalized=normalized[i],
             )
         )
 
@@ -639,11 +643,63 @@ def score_opportunities(
         "Low Priority": 3,
     }
 
+    # job_id is the tertiary key so equal priority+score jobs order the same
+    # way regardless of fetch/completion order (never popularity, company
+    # name or title keywords -- just a stable, arbitrary-but-fixed string).
     opportunities.sort(
         key=lambda o: (
             priority_rank[o.priority],
             -o.score.total,
+            o.job.job_id,
         )
     )
 
     return opportunities
+
+
+# ---------------------------------------------------------------------------
+# Single-job evaluation (the currently analyzed job, outside discovery)
+# ---------------------------------------------------------------------------
+
+def evaluate_current_job(
+    job: JobPosting,
+    profile: CandidateProfile,
+    gap: GapAnalysis,
+    weights: ScoreWeights,
+) -> Opportunity:
+    """Score the one job the user pasted in, using the same eligibility
+    engine, coverage function and Opportunity assembly as discovered jobs.
+
+    There is no comparison pool to rank-normalize a semantic similarity
+    against here, so the "semantic" component is replaced by the evidence
+    ratio from the LLM-verified gap analysis (matched / (matched + missing)).
+    This mirrors what the previous PipelineResult.match_score() did, but
+    now shares one scoring implementation with ranking.py instead of a
+    second, independently-written formula.
+    """
+
+    required = extract_skills(job.jd_text)
+    candidate_skills = profile.all_skills()
+    cov, matched, missing = coverage(required, candidate_skills)
+
+    eligibility_result = analyze_eligibility(job, profile)
+    relevance = role_relevance(job.title, profile.role_families)
+    evidence = _matching_evidence(profile, matched)
+
+    gap_matched = len(gap.matched_requirements)
+    gap_total = gap_matched + len(gap.missing_requirements)
+    evidence_ratio = (gap_matched / gap_total) if gap_total else cov
+
+    return _assemble_opportunity(
+        job=job,
+        weights=weights,
+        required=required,
+        cov=cov,
+        matched=matched,
+        missing=missing,
+        eligibility_result=eligibility_result,
+        relevance=relevance,
+        evidence=evidence,
+        semantic_raw=evidence_ratio,
+        semantic_normalized=evidence_ratio,
+    )

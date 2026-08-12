@@ -97,14 +97,20 @@ def fetch_many(
             "Opportunity Discovery needs them to retrieve live jobs."
         )
 
-    collected: List[JobPosting] = []
+    # Results are gathered concurrently (as_completed just drives progress),
+    # but assembled back into QUERY order rather than completion order, so
+    # which jobs end up first/duplicated-out never depends on network timing.
+    results_by_query: List[List[JobPosting]] = [[] for _ in queries]
     with ThreadPoolExecutor(max_workers=min(len(queries), 6)) as pool:
-        futures = {pool.submit(fetch_one, q, settings): q for q in queries}
-        for future in as_completed(futures):
+        future_to_index = {pool.submit(fetch_one, q, settings): i for i, q in enumerate(queries)}
+        for future in as_completed(future_to_index):
+            index = future_to_index[future]
             try:
-                collected.extend(future.result())
+                results_by_query[index] = future.result()
             except Exception:
-                logger.warning("query thread failed: %s", futures[future])
+                logger.warning("query thread failed: %s", queries[index])
+
+    collected = [job for jobs in results_by_query for job in jobs]
 
     seen, unique = set(), []
     for job in collected:

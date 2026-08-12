@@ -150,3 +150,42 @@ def test_empty_job_description_skips_cover_note_without_crashing():
     assert result.gap.status == "skipped"
     assert result.cover_note.status == "skipped"
     assert result.cover_note.reason
+
+
+def test_current_job_fit_uses_the_canonical_eligibility_engine():
+    """PipelineResult.fit is the single, backend-computed scoring/eligibility
+    result for the analyzed job -- match_score() must delegate to it rather
+    than recomputing anything independently."""
+    result, _, _ = _run()
+    assert result.fit is not None
+    assert result.fit.eligibility_status == "eligible"  # intern title + student profile
+    assert not result.fit.blockers
+    assert result.match_score() == result.fit.score.total
+
+
+def test_current_job_fit_blocks_a_senior_role_for_a_junior_candidate():
+    settings = Settings(discovery_enabled=False)
+    metrics = new_run(settings)
+    clients = make_clients(settings, metrics, llm_responses=RESPONSES)
+    result = run_pipeline(
+        resume_text=RESUME, company="Northwind", title="Senior Backend Engineer",
+        jd_text="Senior Backend Engineer. Requires 8+ years of experience.",
+        settings=settings, clients=clients, metrics=metrics,
+    )
+    assert result.fit.eligibility_status == "ineligible"
+    assert result.fit.blockers
+    assert result.fit.priority in ("Low Priority", "Stretch Opportunity")
+
+
+def test_resume_recommendations_reflect_the_gap_analysis():
+    """resume_recommendations must be populated from the same gap analysis
+    shown elsewhere in the run, with no fabricated skills."""
+    result, _, _ = _run()
+    rec = result.resume_recommendations
+    assert rec.status == "ok"
+    assert any(g.skill == "Docker" for g in rec.missing_skills)
+    allowed = {s.lower() for s in result.profile.all_skills()} | {"docker", "aws", "machine learning", "nlp"}
+    for g in rec.missing_skills:
+        assert g.skill.lower() in allowed
+    for skill in rec.emphasize:
+        assert skill.lower() in {s.lower() for s in result.profile.all_skills()}

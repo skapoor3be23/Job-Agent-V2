@@ -62,13 +62,20 @@ def build_roadmap(
     ]
     items.sort(key=lambda i: (-i.unlocks_jobs, -i.appears_in_jobs))
 
-    best_combo: List[str] = []
-    best_unlocks = 0
+    # Start from the best SINGLE skill. A multi-skill combo only replaces it
+    # if it unlocks STRICTLY more jobs -- otherwise the headline would ask
+    # for an extra skill that provably unlocks nothing beyond what the best
+    # single skill already does on its own (a combo tied with, or beaten
+    # by, one of its own members must never be reported over that member).
+    best_combo: List[str] = [items[0].skill]
+    best_unlocks = items[0].unlocks_jobs
+
     pool = [i.skill for i in items[:4]]
-    for combo in combinations(pool, min(combo_size, len(pool))) if len(pool) >= combo_size else []:
-        unlocks = unlocked_by(list(combo))
-        if unlocks > best_unlocks:
-            best_unlocks, best_combo = unlocks, list(combo)
+    if len(pool) >= combo_size:
+        for combo in combinations(pool, combo_size):
+            unlocks = unlocked_by(list(combo))
+            if unlocks > best_unlocks:
+                best_unlocks, best_combo = unlocks, list(combo)
 
     return SkillRoadmap(
         items=items,

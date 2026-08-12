@@ -78,10 +78,6 @@ for _canon, _aliases in SKILL_VOCAB.items():
     for _alias in _aliases:
         _ALIAS_INDEX.append((_canon, re.compile(r"(?<![a-z0-9+#.])" + re.escape(_alias) + r"(?![a-z0-9])", re.I)))
 
-_YEARS = re.compile(r"(\d+)\s*\+?\s*(?:to\s*\d+\s*)?year", re.I)
-_INTERN_MARKERS = re.compile(r"\b(intern|internship|trainee|fresher|graduate program|entry[- ]level)\b", re.I)
-_SENIOR_MARKERS = re.compile(r"\b(senior|lead|principal|staff|manager|head of|architect)\b", re.I)
-
 
 def extract_skills(text: str) -> List[str]:
     """Canonical skills mentioned in a block of text, in vocabulary order."""
@@ -133,46 +129,6 @@ def coverage(required: Sequence[str], candidate: Sequence[str]) -> Tuple[float, 
     matched = [s for s in req if s.lower() in have]
     missing = [s for s in req if s.lower() not in have]
     return len(matched) / len(req), matched, missing
-
-
-def required_years(jd_text: str) -> float:
-    """Smallest explicit year requirement in a JD, 0.0 if none stated."""
-    if not jd_text:
-        return 0.0
-    values = [float(m) for m in _YEARS.findall(jd_text)]
-    return min(values) if values else 0.0
-
-
-def experience_match(jd_text: str, years: float, level: str) -> Tuple[float, List[str]]:
-    """Score 0..1 for eligibility, plus any hard blockers.
-
-    A senior-titled role demanding years a student does not have is a real
-    blocker and must not be scored away by strong semantic similarity.
-    """
-    blockers: List[str] = []
-    text = jd_text or ""
-    needed = required_years(text)
-    junior_role = bool(_INTERN_MARKERS.search(text))
-    senior_role = bool(_SENIOR_MARKERS.search(text))
-    junior_candidate = level in ("student", "intern", "entry")
-
-    if junior_role and junior_candidate:
-        score = 1.0
-    elif needed <= 0:
-        score = 0.8 if not senior_role else 0.45
-    elif years >= needed:
-        score = 1.0
-    else:
-        shortfall = needed - years
-        score = max(0.0, 1.0 - (shortfall / 5.0))
-        if shortfall >= 3:
-            blockers.append(f"Requires ~{needed:.0f}+ years; resume shows about {years:.0f}")
-
-    if senior_role and junior_candidate:
-        score = min(score, 0.35)
-        blockers.append("Posting is for a senior/lead role")
-
-    return round(score, 4), blockers
 
 
 def role_relevance(title: str, role_families: Sequence[str]) -> float:

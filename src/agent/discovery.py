@@ -152,7 +152,10 @@ def discover_opportunities(
         and (job.jd_text or "").strip()
     ]
 
-    jobs = jobs[: settings.discovery_max_jobs]
+    # IMPORTANT: no cap here. Every deduplicated, usable job is analyzed and
+    # scored below; the display cap is applied only after ranking, so which
+    # jobs survive is decided by relevance/eligibility, never by which
+    # network request happened to complete first.
 
     if not jobs:
         return DiscoveryResult(
@@ -222,22 +225,33 @@ def discover_opportunities(
     #
 
     opportunities = score_opportunities(
-    jobs=jobs,
-    profile=profile,
-    resume_text=resume_text,
-    resume_vector=resume_vector,
-    job_vectors=job_vectors,
-    weights=settings.weights,
-    eligibility_results=eligibility_results,
-)
+        jobs=jobs,
+        profile=profile,
+        resume_text=resume_text,
+        resume_vector=resume_vector,
+        job_vectors=job_vectors,
+        weights=settings.weights,
+        eligibility_results=eligibility_results,
+    )
+
     # ------------------------------------------------------------
-    # 9. Build skill-gap roadmap
+    # 9. Build skill-gap roadmap over the FULL analyzed set (not the
+    # display-capped one), so its stats reflect every job actually
+    # retrieved rather than whichever ones happened to be capped in.
     # ------------------------------------------------------------
 
     roadmap = build_roadmap(jobs, profile)
 
     # ------------------------------------------------------------
-    # 10. Return complete discovery result
+    # 10. Apply the display cap AFTER deterministic ranking. `opportunities`
+    # is already sorted by (priority, -score, job_id) -- see ranking.py --
+    # so this keeps the top-ranked jobs regardless of fetch/completion order.
+    # ------------------------------------------------------------
+
+    opportunities = opportunities[: settings.discovery_max_jobs]
+
+    # ------------------------------------------------------------
+    # 11. Return complete discovery result
     # ------------------------------------------------------------
 
     return DiscoveryResult(

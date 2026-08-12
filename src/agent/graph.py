@@ -46,13 +46,18 @@ from .critique import critique_and_revise
 from .discovery import discover_opportunities
 from .gap import analyze_gap
 from .identity import content_hash, make_job_id
+from .ranking import evaluate_current_job
 from .resume import build_candidate_profile
+from .resume_advice import build_resume_recommendations
 from .schemas import (
     CandidateProfile,
     CompanyResearch,
     CoverNote,
     DiscoveryResult,
     GapAnalysis,
+    JobPosting,
+    Opportunity,
+    ResumeRecommendations,
 )
 from .telemetry import BudgetExceeded, RunMetrics, new_run
 
@@ -268,6 +273,8 @@ class PipelineResult:
         profile: CandidateProfile, gap: GapAnalysis, research: CompanyResearch,
         discovery: DiscoveryResult, cover_note: CoverNote,
         metrics: RunMetrics, notes: Sequence[str],
+        fit: Optional[Opportunity] = None,
+        resume_recommendations: Optional[ResumeRecommendations] = None,
     ):
         self.job_id = job_id
         self.company = company
@@ -280,29 +287,17 @@ class PipelineResult:
         self.cover_note = cover_note
         self.metrics = metrics
         self.notes = list(notes)
+        self.fit = fit
+        self.resume_recommendations = resume_recommendations or ResumeRecommendations()
 
     def match_score(self) -> int:
         """Unified 0-100 match score for the analysed job.
 
-        Same formula as the opportunity score so the current job and the
-        discovered jobs are directly comparable.
+        Delegates to ranking.evaluate_current_job() (computed once in
+        run_pipeline and stored as `fit`) so this and the dashboard never
+        disagree with each other or with how discovered jobs are scored.
         """
-        from .ranking import cosine_similarity
-        from .skills import coverage, experience_match, extract_skills, role_relevance
-
-        required = extract_skills(self.gap_jd_text or "")
-        cov, _, _ = coverage(required, self.profile.all_skills())
-        eligibility, _ = experience_match(
-            self.gap_jd_text or "", self.profile.years_experience, self.profile.experience_level
-        )
-        relevance = role_relevance(self.title, self.profile.role_families)
-        # Without a comparison pool there is no rank-normalisation, so the
-        # semantic component is replaced by the evidence-backed match ratio.
-        matched = len(self.gap.matched_requirements)
-        total = matched + len(self.gap.missing_requirements)
-        evidence_ratio = (matched / total) if total else cov
-        score = 0.45 * evidence_ratio + 0.25 * cov + 0.15 * eligibility + 0.15 * relevance
-        return int(round(max(0.0, min(1.0, score)) * 100))
+        return self.fit.score.total if self.fit else 0
 
     gap_jd_text: str = ""
 
@@ -348,15 +343,30 @@ def run_pipeline(
     app = build_graph(enable_discovery=settings.discovery_enabled)
     final = app.invoke(initial)
 
+    profile: CandidateProfile = final.get("profile") or CandidateProfile()
+    gap: GapAnalysis = final.get("gap") or GapAnalysis(status="skipped")
+
+    current_job = JobPosting(
+        job_id=job_id, company=company or "", title=title or "",
+        jd_text=jd_text or "", location=location or "", url=job_url or "", source="analyzed",
+    )
+    fit = evaluate_current_job(current_job, profile, gap, settings.weights)
+    resume_recommendations = build_resume_recommendations(
+        jd_text=jd_text or "", profile=profile, gap=gap,
+        current_score=fit.score.total, weights=settings.weights,
+    )
+
     result = PipelineResult(
         job_id=job_id, company=company, title=title, job_url=job_url,
-        profile=final.get("profile") or CandidateProfile(),
-        gap=final.get("gap") or GapAnalysis(status="skipped"),
+        profile=profile,
+        gap=gap,
         research=final.get("research") or CompanyResearch(company=company, status="skipped"),
         discovery=final.get("discovery") or DiscoveryResult(status="skipped"),
         cover_note=final.get("cover_note") or CoverNote(job_id=job_id, company=company, title=title),
         metrics=metrics,
         notes=list(final.get("stage_notes", [])) + list(metrics.notes),
+        fit=fit,
+        resume_recommendations=resume_recommendations,
     )
     result.gap_jd_text = jd_text or ""
     return result
