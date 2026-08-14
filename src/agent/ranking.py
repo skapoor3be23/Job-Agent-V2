@@ -26,9 +26,9 @@ from .config import ScoreWeights
 from .eligibility import EligibilityResult, analyze_eligibility
 from .schemas import (
     CandidateProfile,
-    GapAnalysis,
     JobPosting,
     Opportunity,
+    ResumeEvidence,
     ScoreBreakdown,
 )
 from .skills import (
@@ -161,27 +161,56 @@ def rank_normalize(
 # Resume evidence
 # ---------------------------------------------------------------------------
 
+def _evidence_matched_skills(
+    ev: ResumeEvidence,
+    matched_skills: Sequence[str],
+) -> List[str]:
+    """Which of `matched_skills` this ONE evidence item actually demonstrates.
+
+    Combines the LLM-assigned skill tags with a deterministic re-scan of the
+    claim text itself (the same alias matching extract_skills() uses
+    everywhere else), so a strong bullet is credited for every requirement
+    it genuinely shows -- not only the ones an earlier LLM call happened to
+    tag it with. Both signals come straight from the evidence item already
+    on the resume; nothing is invented.
+    """
+
+    demonstrated = {
+        s.lower()
+        for s in ev.skills
+    } | {
+        s.lower()
+        for s in extract_skills(ev.claim)
+    }
+
+    return [
+        skill
+        for skill in matched_skills
+        if skill.lower() in demonstrated
+    ]
+
+
 def _matching_evidence(
     profile: CandidateProfile,
     matched_skills: Sequence[str],
 ) -> List[str]:
-    """Return resume evidence items that demonstrate matched skills."""
+    """Return resume evidence items that demonstrate matched skills.
 
-    wanted = {
-        s.lower()
-        for s in matched_skills
-    }
+    An item that backs several requirements at once is surfaced first, so
+    the display cap below never crowds out the strongest, multi-requirement
+    evidence in favour of several single-skill bullets.
+    """
 
-    hits: List[str] = []
+    scored: List[Tuple[int, str]] = []
 
     for ev in profile.evidence:
-        if any(
-            s.lower() in wanted
-            for s in ev.skills
-        ):
-            hits.append(ev.claim)
+        hits = _evidence_matched_skills(ev, matched_skills)
+        if hits:
+            scored.append((len(hits), ev.claim))
 
-    return hits[:3]
+    scored.sort(key=lambda pair: -pair[0])
+
+    return [claim for _, claim in scored[:3]]
 
 
 # ---------------------------------------------------------------------------
@@ -451,14 +480,32 @@ def _assemble_opportunity(
     evidence: Sequence[str],
     semantic_raw: float,
     semantic_normalized: float,
+    exclude_role_relevance_weight: bool = False,
 ) -> Opportunity:
     eligibility, eligibility_blockers = _eligibility_details(eligibility_result)
 
+    # A degraded (fallback) profile never computed role_families, so
+    # relevance is UNKNOWN here, not a confirmed 0% mismatch. Scoring it as
+    # a confirmed zero would silently punish the candidate for a gap in the
+    # data, not a real gap in fit -- so its weight is excluded and
+    # redistributed across the remaining (real) signals instead of just
+    # zeroing its contribution.
+    semantic_w, coverage_w, experience_w, relevance_w = (
+        weights.semantic, weights.skill_coverage, weights.experience, weights.role_relevance,
+    )
+    if exclude_role_relevance_weight:
+        remaining = semantic_w + coverage_w + experience_w
+        scale = (1.0 / remaining) if remaining else 0.0
+        semantic_w *= scale
+        coverage_w *= scale
+        experience_w *= scale
+        relevance_w = 0.0
+
     total = (
-        weights.semantic * semantic_normalized
-        + weights.skill_coverage * cov
-        + weights.experience * eligibility
-        + weights.role_relevance * relevance
+        semantic_w * semantic_normalized
+        + coverage_w * cov
+        + experience_w * eligibility
+        + relevance_w * relevance
     )
     total = max(0.0, min(1.0, total))
 
@@ -470,10 +517,10 @@ def _assemble_opportunity(
         role_relevance=round(relevance, 4),
         total=int(round(total * 100)),
         formula=(
-            f"{weights.semantic:.0%}x{semantic_normalized:.2f} + "
-            f"{weights.skill_coverage:.0%}x{cov:.2f} + "
-            f"{weights.experience:.0%}x{eligibility:.2f} + "
-            f"{weights.role_relevance:.0%}x{relevance:.2f}"
+            f"{semantic_w:.0%}x{semantic_normalized:.2f} + "
+            f"{coverage_w:.0%}x{cov:.2f} + "
+            f"{experience_w:.0%}x{eligibility:.2f} + "
+            f"{relevance_w:.0%}x{relevance:.2f}"
         ),
     )
 
@@ -555,18 +602,10 @@ def score_opportunities(
 
         raw_similarities.append(sim)
 
-    # ------------------------------------------------------------
-    # 2. Normalize semantic similarities by rank
-    # ------------------------------------------------------------
-
-    normalized = rank_normalize(
-        raw_similarities
-    )
-
     opportunities: List[Opportunity] = []
 
     # ------------------------------------------------------------
-    # 3. Analyze every job
+    # 2. Analyze every job
     # ------------------------------------------------------------
 
     for i, job in enumerate(jobs):
@@ -612,9 +651,18 @@ def score_opportunities(
         )
 
         # --------------------------------------------------------
-        # Score, priority and Opportunity assembly (shared with the
-        # single-job path in evaluate_current_job)
+        # Score, priority and Opportunity assembly -- shared with the
+        # single-job path in evaluate_current_job, which is exactly why
+        # semantic_normalized is the raw (clamped) similarity here too,
+        # not a pool-relative rank. Rank-normalizing against whichever
+        # other jobs happened to be fetched in THIS discovery batch made
+        # the same job's score depend on its neighbors, so a job opened
+        # directly (no pool to rank against) could never agree with its
+        # own discovered score even after eligibility/coverage/evidence
+        # were already unified.
         # --------------------------------------------------------
+
+        semantic = max(0.0, min(1.0, raw_similarities[i] or 0.0))
 
         opportunities.append(
             _assemble_opportunity(
@@ -628,12 +676,12 @@ def score_opportunities(
                 relevance=relevance,
                 evidence=evidence,
                 semantic_raw=raw_similarities[i] or 0.0,
-                semantic_normalized=normalized[i],
+                semantic_normalized=semantic,
             )
         )
 
     # ------------------------------------------------------------
-    # 4. Deterministic ordering
+    # 3. Deterministic ordering
     # ------------------------------------------------------------
 
     priority_rank = {
@@ -664,18 +712,28 @@ def score_opportunities(
 def evaluate_current_job(
     job: JobPosting,
     profile: CandidateProfile,
-    gap: GapAnalysis,
     weights: ScoreWeights,
+    resume_text: str = "",
+    resume_vector: Optional[Sequence[float]] = None,
+    job_vector: Optional[Sequence[float]] = None,
 ) -> Opportunity:
-    """Score the one job the user pasted in, using the same eligibility
-    engine, coverage function and Opportunity assembly as discovered jobs.
+    """Score the one job the user pasted in.
 
-    There is no comparison pool to rank-normalize a semantic similarity
-    against here, so the "semantic" component is replaced by the evidence
-    ratio from the LLM-verified gap analysis (matched / (matched + missing)).
-    This mirrors what the previous PipelineResult.match_score() did, but
-    now shares one scoring implementation with ranking.py instead of a
-    second, independently-written formula.
+    Uses the same eligibility engine, coverage function, evidence matching
+    and semantic-similarity signal (embedding cosine similarity, falling
+    back to lexical similarity -- see cosine_similarity()/lexical_similarity()
+    above) as score_opportunities(). The only structural difference is that
+    a single job has no comparison pool to rank-normalize its similarity
+    against, so the raw similarity is used directly instead of a rank.
+
+    A previous version used the evidence ratio from the LLM-verified gap
+    analysis (matched / (matched + missing)) as a stand-in for "semantic".
+    That was a second, independently-computed signal -- subject to LLM
+    phrasing and not pool-relative at all -- so the exact same job could
+    score very differently here than in Opportunity Discovery. Callers that
+    already have a discovery-computed Opportunity for this exact job should
+    prefer reusing it (see run_pipeline's `known_fit`) rather than calling
+    this function a second time.
     """
 
     required = extract_skills(job.jd_text)
@@ -686,9 +744,14 @@ def evaluate_current_job(
     relevance = role_relevance(job.title, profile.role_families)
     evidence = _matching_evidence(profile, matched)
 
-    gap_matched = len(gap.matched_requirements)
-    gap_total = gap_matched + len(gap.missing_requirements)
-    evidence_ratio = (gap_matched / gap_total) if gap_total else cov
+    raw_sim = cosine_similarity(resume_vector, job_vector)
+    if raw_sim is None:
+        raw_sim = lexical_similarity(resume_text, job.jd_text)
+    semantic = max(0.0, min(1.0, raw_sim))
+
+    # A degraded profile never computed role_families, so relevance is
+    # unknown rather than a confirmed 0% mismatch -- see _assemble_opportunity.
+    exclude_role_relevance_weight = profile.is_degraded and not profile.role_families
 
     return _assemble_opportunity(
         job=job,
@@ -700,6 +763,7 @@ def evaluate_current_job(
         eligibility_result=eligibility_result,
         relevance=relevance,
         evidence=evidence,
-        semantic_raw=evidence_ratio,
-        semantic_normalized=evidence_ratio,
+        semantic_raw=semantic,
+        semantic_normalized=semantic,
+        exclude_role_relevance_weight=exclude_role_relevance_weight,
     )

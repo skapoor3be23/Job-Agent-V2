@@ -22,8 +22,23 @@ from agent import store
 from agent.clients import credential_status
 from agent.config import get_settings
 from agent.graph import run_pipeline
+from agent.identity import make_job_id
 from agent.resume import extract_pdf_text
 from agent.schemas import DiscoveryResult
+
+# How many discovered jobs' scores to keep on hand so "Analyze this job
+# instead" can reuse the exact already-computed Opportunity (see
+# _remember_known_fit / render_dashboard) without an unbounded session.
+KNOWN_FIT_CACHE_LIMIT = 50
+
+
+def _remember_known_fit(job_id: str, opportunity) -> None:
+    """Stash a discovery-computed Opportunity so opening that job later
+    reuses its score/eligibility instead of recomputing a second one."""
+    cache_dict = st.session_state.setdefault("known_fit_by_job_id", {})
+    cache_dict[job_id] = opportunity
+    if len(cache_dict) > KNOWN_FIT_CACHE_LIMIT:
+        cache_dict.pop(next(iter(cache_dict)), None)
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
 
@@ -292,6 +307,7 @@ def section_opportunities(result) -> None:
                 st.link_button("Open job listing", opp.job.url)
 
             if st.button("Analyze this job instead", key=f"deep_{opp.job.job_id}"):
+                _remember_known_fit(opp.job.job_id, opp)
                 st.session_state["deep_analysis_request"] = {
                     "company": opp.job.company, "title": opp.job.title,
                     "jd_text": opp.job.jd_text, "job_url": opp.job.url,
@@ -440,12 +456,18 @@ def render_dashboard() -> None:
         if company not in seen:
             seen.append(company)
 
+        # If this exact job was just opened from the discovery list, reuse
+        # the Opportunity computed there instead of scoring it again --
+        # this is what keeps the discovered and opened scores identical.
+        job_id_now = make_job_id(company, title, job_url, location, jd_text)
+        known_fit = st.session_state.get("known_fit_by_job_id", {}).get(job_id_now)
+
         with st.status("Running analysis...", expanded=False) as status:
             try:
                 result = run_pipeline(
                     resume_text=resume_text, company=company, title=title, jd_text=jd_text,
                     job_url=job_url, location=location, session_companies=seen,
-                    settings=SETTINGS,
+                    settings=SETTINGS, known_fit=known_fit,
                 )
                 status.update(label="Analysis complete", state="complete")
             except Exception as exc:

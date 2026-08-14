@@ -12,19 +12,105 @@ without extending the critical path:
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence
 
+from . import cache
 from .adzuna import JobSourceUnavailable, fetch_many
 from .eligibility import EligibilityResult, analyze_eligibility
 from .clients import Clients
 from .config import Settings
+from .identity import resume_hash
 from .ranking import score_opportunities
 from .roadmap import build_roadmap
-from .schemas import CandidateProfile, DiscoveryResult
+from .schemas import CandidateProfile, DiscoveryResult, JobPosting, Opportunity
 from .telemetry import BudgetExceeded, RunMetrics
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _DiscoveryPool:
+    """Everything about a profile's discovery pool that costs a network or
+    embedding call to produce, cached by profile/resume signature only --
+    never by which job the caller wants excluded, since that differs on
+    every "analyze this job instead" click and would defeat the cache.
+    Excluding the currently-viewed job and applying the display cap happen
+    AFTER retrieval (hit or miss), in discover_opportunities().
+    """
+
+    jobs_fetched: int = 0
+    jobs: List[JobPosting] = field(default_factory=list)
+    opportunities: List[Opportunity] = field(default_factory=list)
+    degraded_note: Optional[str] = None
+
+
+def _compute_discovery_pool(
+    profile: CandidateProfile,
+    resume_text: str,
+    queries: List[str],
+    clients: Clients,
+    settings: Settings,
+    metrics: RunMetrics,
+) -> _DiscoveryPool:
+    """The expensive part of discovery: fetch, deterministic eligibility,
+    one batched embedding call, and deterministic scoring. Pulled out of
+    discover_opportunities() so it can be cached as a unit."""
+
+    jobs = fetch_many(queries, settings, metrics)
+    fetched = len(jobs)
+
+    jobs = [job for job in jobs if (job.jd_text or "").strip()]
+
+    if not jobs:
+        return _DiscoveryPool(jobs_fetched=fetched)
+
+    eligibility_results: Dict[str, EligibilityResult] = {
+        job.job_id: analyze_eligibility(job, profile)
+        for job in jobs
+    }
+
+    resume_vector = None
+    job_vectors: List[Optional[Sequence[float]]] = [None] * len(jobs)
+    degraded_note: Optional[str] = None
+
+    try:
+        texts = [resume_text] + [job.jd_text for job in jobs]
+        vectors = clients.embeddings.embed_documents(texts)
+        resume_vector = vectors[0]
+        job_vectors = list(vectors[1:])
+    except BudgetExceeded as exc:
+        degraded_note = (
+            f"Opportunity ranking: {exc} "
+            "Ranked on keyword similarity instead."
+        )
+    except Exception as exc:
+        logger.warning(
+            "embedding failed during discovery: %s",
+            type(exc).__name__,
+        )
+        degraded_note = (
+            "Embeddings unavailable; opportunities ranked "
+            "on keyword similarity instead."
+        )
+
+    opportunities = score_opportunities(
+        jobs=jobs,
+        profile=profile,
+        resume_text=resume_text,
+        resume_vector=resume_vector,
+        job_vectors=job_vectors,
+        weights=settings.weights,
+        eligibility_results=eligibility_results,
+    )
+
+    return _DiscoveryPool(
+        jobs_fetched=fetched,
+        jobs=jobs,
+        opportunities=opportunities,
+        degraded_note=degraded_note,
+    )
 
 
 def build_search_queries(
@@ -111,11 +197,33 @@ def discover_opportunities(
         )
 
     # ------------------------------------------------------------
-    # 4. Retrieve jobs from Adzuna
+    # 4-8. Fetch, deterministic eligibility, one batched embedding call and
+    # deterministic scoring -- cached as a unit, keyed by profile/resume
+    # signature (never by exclude_job_ids, which is different on every
+    # "analyze this job instead" click and would defeat the cache). A
+    # second job opened from the same discovery list within the TTL costs
+    # zero additional Adzuna requests and zero additional embedding calls.
     # ------------------------------------------------------------
 
+    pool_key = cache.make_key(
+        "discovery_pool",
+        settings.embedding_model,
+        settings.adzuna_country,
+        settings.discovery_results_per_query,
+        resume_hash(resume_text),
+        "|".join(q.lower() for q in queries),
+    )
+
+    def compute_pool() -> _DiscoveryPool:
+        return _compute_discovery_pool(
+            profile, resume_text, queries, clients, settings, metrics,
+        )
+
     try:
-        jobs = fetch_many(queries, settings, metrics)
+        pool = cache.get_or_compute(
+            pool_key, compute_pool, ttl_s=settings.job_analysis_ttl_s,
+            metrics=metrics, enabled=settings.cache_enabled,
+        )
 
     except JobSourceUnavailable as exc:
         metrics.note(f"Opportunity Discovery: {exc}")
@@ -137,102 +245,28 @@ def discover_opportunities(
             reason=f"Job retrieval failed ({type(exc).__name__}).",
         )
 
-    # ------------------------------------------------------------
-    # 5. Remove excluded / unusable jobs
-    # ------------------------------------------------------------
+    if pool.degraded_note:
+        metrics.note(pool.degraded_note)
 
-    fetched = len(jobs)
-
-    excluded = set(exclude_job_ids or [])
-
-    jobs = [
-        job
-        for job in jobs
-        if job.job_id not in excluded
-        and (job.jd_text or "").strip()
-    ]
-
-    # IMPORTANT: no cap here. Every deduplicated, usable job is analyzed and
-    # scored below; the display cap is applied only after ranking, so which
-    # jobs survive is decided by relevance/eligibility, never by which
-    # network request happened to complete first.
-
-    if not jobs:
+    if not pool.jobs:
         return DiscoveryResult(
             queries_used=queries,
-            jobs_fetched=fetched,
+            jobs_fetched=pool.jobs_fetched,
             status="no_results",
             reason="No usable opportunities were returned for your profile.",
         )
 
     # ------------------------------------------------------------
-    # 6. Deterministic eligibility analysis
-    # ------------------------------------------------------------
-    #
-    # Every job is analyzed before ranking.
-    #
-    # IMPORTANT:
-    # Ineligible jobs are NOT removed.
-    #
-    # Their eligibility result is preserved so the application can explain
-    # why a job is unsuitable instead of silently hiding it.
-    #
-
-    eligibility_results: Dict[str, EligibilityResult] = {
-        job.job_id: analyze_eligibility(job, profile)
-        for job in jobs
-    }
-
-    # ------------------------------------------------------------
-    # 7. One batched embedding call for the resume + every JD
+    # 5. Remove the excluded (currently-analyzed) job. IMPORTANT: no cap
+    # here beyond that -- the display cap is applied only after ranking,
+    # so which jobs survive is decided by relevance/eligibility, never by
+    # which network request happened to complete first.
     # ------------------------------------------------------------
 
-    resume_vector = None
+    excluded = set(exclude_job_ids or [])
 
-    job_vectors = [None] * len(jobs)
-
-    try:
-        texts = [resume_text] + [job.jd_text for job in jobs]
-
-        vectors = clients.embeddings.embed_documents(texts)
-
-        resume_vector = vectors[0]
-        job_vectors = list(vectors[1:])
-
-    except BudgetExceeded as exc:
-        metrics.note(
-            f"Opportunity ranking: {exc} "
-            "Ranked on keyword similarity instead."
-        )
-
-    except Exception as exc:
-        logger.warning(
-            "embedding failed during discovery: %s",
-            type(exc).__name__,
-        )
-
-        metrics.note(
-            "Embeddings unavailable; opportunities ranked "
-            "on keyword similarity instead."
-        )
-
-    # ------------------------------------------------------------
-    # 8. Deterministic opportunity scoring
-    # ------------------------------------------------------------
-    #
-    # ranking.py will receive the eligibility results and attach them
-    # to each Opportunity.
-    #
-
-    opportunities = score_opportunities(
-        jobs=jobs,
-        profile=profile,
-        resume_text=resume_text,
-        resume_vector=resume_vector,
-        job_vectors=job_vectors,
-        weights=settings.weights,
-        eligibility_results=eligibility_results,
-    )
+    surviving_jobs = [job for job in pool.jobs if job.job_id not in excluded]
+    opportunities = [o for o in pool.opportunities if o.job.job_id not in excluded]
 
     # ------------------------------------------------------------
     # 9. Build skill-gap roadmap over the FULL analyzed set (not the
@@ -240,7 +274,7 @@ def discover_opportunities(
     # retrieved rather than whichever ones happened to be capped in.
     # ------------------------------------------------------------
 
-    roadmap = build_roadmap(jobs, profile)
+    roadmap = build_roadmap(surviving_jobs, profile)
 
     # ------------------------------------------------------------
     # 10. Apply the display cap AFTER deterministic ranking. `opportunities`
@@ -256,8 +290,8 @@ def discover_opportunities(
 
     return DiscoveryResult(
         queries_used=queries,
-        jobs_fetched=fetched,
-        jobs_deduplicated=len(jobs),
+        jobs_fetched=pool.jobs_fetched,
+        jobs_deduplicated=len(surviving_jobs),
         opportunities=opportunities,
         roadmap=roadmap,
         status="ok",

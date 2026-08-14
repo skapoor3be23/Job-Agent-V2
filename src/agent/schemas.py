@@ -40,6 +40,15 @@ class CandidateProfile(BaseModel):
     )
     experience_level: Literal["student", "intern", "entry", "mid", "senior"] = "student"
     years_experience: float = Field(default=0.0, ge=0.0, le=50.0)
+    is_degraded: bool = Field(
+        default=False,
+        description=(
+            "True only when this profile came from the deterministic keyword "
+            "fallback (LLM unavailable or budgeted out), not a real LLM-read "
+            "of the resume. A successfully computed profile always overrides "
+            "this to False, regardless of what the model itself returned."
+        ),
+    )
 
     def all_skills(self) -> List[str]:
         seen, out = set(), []

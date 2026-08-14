@@ -98,6 +98,36 @@ def test_branches_execute_concurrently():
     assert elapsed < 2.35, f"branches did not overlap: {elapsed:.2f}s"
 
 
+def test_company_research_overlaps_candidate_profile_not_serialized_behind_it():
+    """Performance regression: research_company() reads only `company`/
+    `title` -- both available before candidate_profile even starts -- so it
+    must run concurrently with candidate_profile's LLM call, not wait for
+    it to finish first. A prior version gated it behind candidate_profile
+    as an ordinary graph branch, serializing the single slowest stage
+    behind a stage it had no data dependency on.
+
+    Company Research is deliberately made the slowest stage here (a 1.0s
+    search call on top of the shared 0.5s LLM latency, vs 0.5s for every
+    other stage) so overlap vs serialization produces a clear, unambiguous
+    timing difference: ~2.5s overlapped vs ~3.0s if serialized again.
+    """
+    settings = Settings(discovery_enabled=False)
+    metrics = new_run(settings)
+    clients = make_clients(
+        settings, metrics, llm_responses=RESPONSES,
+        llm_latency=0.5, search_latency=1.0,
+    )
+    start = time.perf_counter()
+    run_pipeline(
+        resume_text=RESUME, company="Northwind", title="ML Intern", jd_text=JD,
+        settings=settings, clients=clients, metrics=metrics,
+    )
+    elapsed = time.perf_counter() - start
+    # Overlapped: max(profile=0.5, research=1.5) + gap(0.5) + cover(0.5) + critique(0.5) = ~2.5s
+    # Serialized: profile(0.5) + research(1.5) + cover(0.5) + critique(0.5) = ~3.0s
+    assert elapsed < 2.8, f"Company Research did not overlap with Candidate Profile: {elapsed:.2f}s"
+
+
 def test_failed_company_research_still_produces_analysis():
     result, _, _ = _run(search_fail=True)
     assert result.research.status == "no_results"

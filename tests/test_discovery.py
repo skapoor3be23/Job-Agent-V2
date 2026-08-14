@@ -193,6 +193,79 @@ def test_stretch_opportunity_reason_never_contains_the_positive_eligibility_mess
     assert o.priority == "Stretch Opportunity"
 
 
+# ---------------------------------------------------------------------------
+# Evidence-to-requirement mapping: one resume bullet, many requirements
+# ---------------------------------------------------------------------------
+
+def test_one_evidence_item_supports_multiple_requirements():
+    """A single strong resume bullet that genuinely demonstrates several JD
+    requirements must be credited for all of them -- not only the one skill
+    an earlier LLM call happened to tag it with. Nothing here is invented:
+    the extra credit comes only from re-scanning the bullet's own claim
+    text with the same deterministic skill vocabulary used everywhere else.
+    """
+    profile = CandidateProfile(
+        primary_skills=["Python", "PyTorch", "NLP", "Computer Vision"],
+        role_families=["Machine Learning Intern"],
+        experience_level="student", years_experience=0.0,
+        evidence=[
+            ResumeEvidence(
+                claim="Built an NLP and computer vision pipeline in PyTorch and Python",
+                skills=["NLP"],  # deliberately narrow tagging from profile-build time
+            ),
+        ],
+    )
+    strong_jd = job(
+        "Delta", "Machine Learning Intern",
+        "Machine Learning Intern. Python, PyTorch, NLP and Computer Vision required.",
+        "https://x.com/delta",
+    )
+
+    opp = score_opportunities(
+        [strong_jd], profile, "Python PyTorch NLP Computer Vision", None, [None], ScoreWeights(),
+    )[0]
+
+    assert set(opp.matched_skills) >= {"Python", "PyTorch", "NLP", "Computer Vision"}
+    # Only one evidence item exists on the whole profile, yet it is credited
+    # as supporting the match.
+    assert len(opp.evidence) == 1
+    assert "computer vision pipeline" in opp.evidence[0].lower()
+
+    from agent.ranking import _evidence_matched_skills
+
+    hits = _evidence_matched_skills(profile.evidence[0], opp.matched_skills)
+    assert len(hits) >= 3  # one bullet backing Python, PyTorch, NLP and Computer Vision at once
+    assert {"Python", "PyTorch", "NLP"}.issubset(set(hits))
+
+
+def test_evidence_ordering_favors_the_item_supporting_the_most_requirements():
+    """When several evidence items compete for the display cap, the one
+    demonstrating the most matched requirements must surface first."""
+    profile = CandidateProfile(
+        primary_skills=["Python", "PyTorch", "NLP", "SQL"],
+        role_families=["Machine Learning Intern"],
+        experience_level="student", years_experience=0.0,
+        evidence=[
+            ResumeEvidence(claim="Used SQL for a class project", skills=["SQL"]),
+            ResumeEvidence(
+                claim="Built an NLP pipeline in PyTorch using Python end to end",
+                skills=["NLP"],
+            ),
+        ],
+    )
+    strong_jd = job(
+        "Epsilon", "Machine Learning Intern",
+        "Machine Learning Intern. Python, PyTorch, NLP and SQL required.",
+        "https://x.com/epsilon",
+    )
+
+    opp = score_opportunities(
+        [strong_jd], profile, "Python PyTorch NLP SQL", None, [None], ScoreWeights(),
+    )[0]
+
+    assert opp.evidence[0].startswith("Built an NLP pipeline")
+
+
 def test_tiebreak_by_job_id_is_stable_regardless_of_input_order():
     a = job("Same", "ML Intern", "Python PyTorch NLP required.", "https://x.com/aaa")
     b = job("Same", "ML Intern", "Python PyTorch NLP required.", "https://x.com/bbb")
